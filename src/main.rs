@@ -3,7 +3,7 @@ use std::path::{Path,PathBuf};
 use std::{fs,env};
 use anyhow::anyhow;
 use embedded_can::{blocking::Can, Frame as EmbeddedFrame, ExtendedId};
-use socketcan::{CanFdSocket, CanFrame, Result, Socket};
+use socketcan::{CanFdSocket, CanFdFrame, Result, Socket};
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short, long)]
@@ -72,10 +72,24 @@ fn main() -> anyhow::Result<()> {
 
         }
     };
-    
-    println!("Node ID: {}", nodeid);
-    let test_id = dfr_can_id(3,5,5,1).expect("Error creating CAN ID");
-    println!("{:029b}",test_id.as_raw());
+    /*
+    println!("Node ID: {:05b}", nodeid);
+    let test_id = dfr_can_id(5,nodeid,5,1).expect("Error creating CAN ID");
+
+    println!("ID as decimal {}", test_id.as_raw());
+    println!("ID as binary: {:029b}",test_id.as_raw());
+    println!("ID as hex {:08X}", test_id.as_raw());
+    */
+    match write_binary(&binvec,&sock,0x06,0x01){
+        Ok(_) => {
+            println!("Successfully wrote binary :D");
+        }
+        Err(e) => {
+            anyhow::bail!(e);
+        }
+    }
+
+
     Ok(())
 }
 
@@ -95,4 +109,15 @@ fn dfr_can_id(priority: u32, target: u32, command: u32, source: u32 ) -> anyhow:
     Ok(embedded_can::ExtendedId::new(id_u32).unwrap())
 
 
+}
+fn write_binary(binv: &Vec<u8>, tx: &CanFdSocket, targetid: u32, sourceid: u32) -> anyhow::Result<()> {
+    for (i, chunk) in binv.chunks(64).enumerate() {
+        let id = dfr_can_id(1, targetid, 0xAAAA, sourceid)?;
+        if let Some(frame) = socketcan::CanFdFrame::new(id, chunk) {
+            tx.write_frame(&frame)?;
+            //println!("Sent chunk {} with {} bytes", i, chunk.len());
+        }
+    }
+
+    Ok(())
 }
