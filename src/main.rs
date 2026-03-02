@@ -28,17 +28,16 @@ fn main() {
     };
 
     println!("Attempting to read: {:?}", resolved_path);
-    let binvec: Vec<u8>;
-    match fs::read(&resolved_path) {
+    let binvec: Vec<u8> = match fs::read(&resolved_path) {
         Ok(bytes) => {
             println!("Success! Read {} bytes.", bytes.len());
-            binvec = bytes;
+            bytes
         }
         Err(e) => {
             eprintln!("Error reading binary file {:?}: {}", resolved_path, e);
             std::process::exit(1);
         }
-    }
+    };
 
     for i in 0..10{
         println!("Byte {} = {}",i,hex::encode(&[binvec[i]]));
@@ -61,4 +60,6 @@ fn main() {
             std::process::exit(1);
         }
     };
+    
+    println!("Node ID: {}", nodeid);
 }
