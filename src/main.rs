@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use clap::Parser;
 use embedded_can::{Id, Frame as EmbeddedFrame};
+use indicatif::{ProgressBar, ProgressStyle};
 use socketcan::{CanFdFrame, CanFdSocket, Socket};
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -136,6 +137,14 @@ fn write_binary(
 
     let base_address: u32 = 0x0800_8000;
 
+    let total_chunks = binv.chunks(64).count();
+    let pb = ProgressBar::new(total_chunks as u64);
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} chunks ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
     for (i, chunk) in binv.chunks(64).enumerate() {
         let chunk_address = base_address + (i * 64) as u32;
         let chunk_size = chunk.len() as u8;
@@ -163,7 +172,7 @@ fn write_binary(
 
         if let Some(frame_write) = CanFdFrame::new(ext_id_write, chunk) {
             sock.write_frame(&frame_write)?;
-            println!("Sent chunk {} ({} bytes) at address 0x{:08X}", i, chunk_size, chunk_address);
+            //println!("Sent chunk {} ({} bytes) at address 0x{:08X}", i, chunk_size, chunk_address);
         }
         loop {
             let rx_frame = sock.read_frame()?;
@@ -181,6 +190,7 @@ fn write_binary(
                         let ack_size = data[4];
 
                         if ack_addr == chunk_address && ack_size == chunk_size {
+                            pb.inc(1);
                             break;
                         } else {
                             return Err(anyhow::format_err!(
@@ -194,5 +204,6 @@ fn write_binary(
         }
     }
 
+    pb.finish_with_message("done");
     Ok(())
 }
