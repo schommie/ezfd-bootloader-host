@@ -4,6 +4,7 @@ use embedded_can::{Id, Frame as EmbeddedFrame};
 use indicatif::{ProgressBar, ProgressStyle};
 use socketcan::{CanFdFrame, CanFdSocket, Socket};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::fs;
 
 mod protocol;
@@ -21,10 +22,20 @@ struct Args {
     node_id: String,
 }
 
+fn send_frame(sock: &CanFdSocket, target: u16, command: BootloaderCommand, source: u16, data: &[u8]) -> anyhow::Result<()> {
+    let id = DfrCanId::new(1, target, command.into(), source)
+        .map_err(|e| anyhow::format_err!(e))?;
+    let ext_id = embedded_can::ExtendedId::new(id.to_raw_id()).unwrap();
+    if let Some(frame) = CanFdFrame::new(ext_id, data) {
+        sock.write_frame(&frame)?;
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let mut sock = match CanFdSocket::open(&args.interface) {
+    let sock = match CanFdSocket::open(&args.interface) {
         Ok(sock) => {
             println!("Successfully opened interface on {}", args.interface);
             sock
@@ -78,16 +89,76 @@ fn main() -> anyhow::Result<()> {
             ));
         }
     };
-    println!("Sending Erase command...");
 
-    let id_erase = DfrCanId::new(1, nodeid, BootloaderCommand::Erase.into(), sourceid)
-        .map_err(|e| anyhow::format_err!(e))?;
+    println!("Pinging device 0x{:02X}...", nodeid);
+    sock.set_read_timeout(Duration::from_millis(500))?;
+    send_frame(&sock, nodeid, BootloaderCommand::Ping, sourceid, &[])?;
 
-    let ext_id_erase = embedded_can::ExtendedId::new(id_erase.to_raw_id()).unwrap();
-
-    if let Some(frame_erase) = CanFdFrame::new(ext_id_erase, &[]) {
-        sock.write_frame(&frame_erase)?;
+    let mut device_in_bootloader = false;
+    let ping_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < ping_deadline {
+        match sock.read_frame() {
+            Ok(rx_frame) => {
+                if let Id::Extended(ext_id) = rx_frame.id() {
+                    let msg_id = parse_can_id(ext_id.as_raw());
+                    if msg_id.target == sourceid
+                        && msg_id.source == nodeid
+                        && msg_id.command == BootloaderCommand::Ping.into()
+                    {
+                        let data = rx_frame.data();
+                        let status = data.first().copied().unwrap_or(0xFF);
+                        if status == 0 {
+                            println!("Device is in bootloader mode.");
+                            device_in_bootloader = true;
+                        } else if status == 1 {
+                            println!("Device is in application mode.");
+                        } else {
+                            println!("Unexpected ping status byte: 0x{:02X}", status);
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
     }
+
+    if !device_in_bootloader {
+        println!("Sending Reboot command...");
+        send_frame(&sock, nodeid, BootloaderCommand::Reboot, sourceid, &[])?;
+
+        println!("Waiting for device to reboot and send FirmwareUpdateQuery...");
+        sock.set_read_timeout(Duration::from_secs(5))?;
+        let query_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got_query = false;
+        while std::time::Instant::now() < query_deadline {
+            match sock.read_frame() {
+                Ok(rx_frame) => {
+                    if let Id::Extended(ext_id) = rx_frame.id() {
+                        let msg_id = parse_can_id(ext_id.as_raw());
+                        if msg_id.target == sourceid
+                            && msg_id.source == nodeid
+                            && msg_id.command == BootloaderCommand::FirmwareUpdateQuery.into()
+                        {
+                            println!("Received FirmwareUpdateQuery, responding with update=true");
+                            send_frame(&sock, nodeid, BootloaderCommand::FirmwareUpdateResponse, sourceid, &[1u8])?;
+                            got_query = true;
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if !got_query {
+            anyhow::bail!("Timed out waiting for device FirmwareUpdateQuery after reboot");
+        }
+    }
+
+    sock.set_read_timeout(Duration::from_secs(30))?;
+
+    println!("Sending Erase command...");
+    send_frame(&sock, nodeid, BootloaderCommand::Erase, sourceid, &[])?;
 
     println!("Waiting for device to erase flash...");
     loop {
@@ -106,18 +177,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    match write_binary(&binvec, &mut sock, nodeid, CanDevices::RaspberryPi as u16) {
+    match write_binary(&binvec, &sock, nodeid, sourceid) {
         Ok(_) => {
             println!("Successfully wrote binary :D");
             println!("Sending jump command...");
-            let id_jump = DfrCanId::new(1, nodeid, BootloaderCommand::Jump.into(), sourceid)
-                .map_err(|e| anyhow::format_err!(e))?;
-            let ext_id_jump = embedded_can::ExtendedId::new(id_jump.to_raw_id()).unwrap();
-
-            if let Some(frame_jump) = CanFdFrame::new(ext_id_jump, &[]) {
-                sock.write_frame(&frame_jump)?;
-            }
-
+            send_frame(&sock, nodeid, BootloaderCommand::Jump, sourceid, &[])?;
         }
         Err(e) => {
             anyhow::bail!(e);
@@ -129,7 +193,7 @@ fn main() -> anyhow::Result<()> {
 
 fn write_binary(
     binv: &Vec<u8>,
-    sock: &mut CanFdSocket,
+    sock: &CanFdSocket,
     targetid: u16,
     sourceid: u16,
 ) -> anyhow::Result<()> {
@@ -158,22 +222,9 @@ fn write_binary(
             chunk_size,
         ];
 
-        let id_addr = DfrCanId::new(1, targetid, BootloaderCommand::AddressAndSize.into(), sourceid)
-            .map_err(|e| anyhow::format_err!(e))?;
-        let ext_id_addr = embedded_can::ExtendedId::new(id_addr.to_raw_id()).unwrap();
+        send_frame(sock, targetid, BootloaderCommand::AddressAndSize, sourceid, &payload)?;
+        send_frame(sock, targetid, BootloaderCommand::Write, sourceid, chunk)?;
 
-        if let Some(frame_addr) = CanFdFrame::new(ext_id_addr, &payload) {
-            sock.write_frame(&frame_addr)?;
-        }
-
-        let id_write = DfrCanId::new(1, targetid, BootloaderCommand::Write.into(), sourceid)
-            .map_err(|e| anyhow::format_err!(e))?;
-        let ext_id_write = embedded_can::ExtendedId::new(id_write.to_raw_id()).unwrap();
-
-        if let Some(frame_write) = CanFdFrame::new(ext_id_write, chunk) {
-            sock.write_frame(&frame_write)?;
-            //println!("Sent chunk {} ({} bytes) at address 0x{:08X}", i, chunk_size, chunk_address);
-        }
         loop {
             let rx_frame = sock.read_frame()?;
 
