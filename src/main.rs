@@ -127,11 +127,9 @@ fn main() -> anyhow::Result<()> {
         println!("Sending Reboot command...");
         send_frame(&sock, nodeid, BootloaderCommand::Reboot, sourceid, &[])?;
 
-        println!("Waiting for device to reboot and send FirmwareUpdateQuery...");
+        println!("Waiting for device FirmwareUpdateQuery (power-cycle the device if needed)...");
         sock.set_read_timeout(Duration::from_secs(5))?;
-        let query_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut got_query = false;
-        while std::time::Instant::now() < query_deadline {
+        loop {
             match sock.read_frame() {
                 Ok(rx_frame) => {
                     if let Id::Extended(ext_id) = rx_frame.id() {
@@ -142,16 +140,16 @@ fn main() -> anyhow::Result<()> {
                         {
                             println!("Received FirmwareUpdateQuery, responding with update=true");
                             send_frame(&sock, nodeid, BootloaderCommand::FirmwareUpdateResponse, sourceid, &[1u8])?;
-                            got_query = true;
                             break;
                         }
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    print!(".");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
             }
-        }
-        if !got_query {
-            anyhow::bail!("Timed out waiting for device FirmwareUpdateQuery after reboot");
         }
     }
 
